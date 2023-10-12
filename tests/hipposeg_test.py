@@ -22,6 +22,3 @@ class CTHeadAlignTest(unittest.TestCase):
         input_nii_path = os.path.join(test_data_path, 'HCP_100206_3T_T1w_MPR1.nii.gz')
         output_nii_path = os.path.join(test_working_path, 'hippocampi-labels.nii.gz')
         hipposeg.segment(input_nii_path, output_nii_path)
-
-if __name__ == '__main__':
-    unittest.main()

@@ -1,15 +1,19 @@
 import configparser
+import os
+import shutil
+import time
+from itertools import product
+
+import ants
 import monai
 import numpy as np
-import os
 import scipy as sp
 import SimpleITK as sitk
-import time
 import torch
-
 from monai.inferers import sliding_window_inference
 from monai.networks.layers import Norm
 from skimage.measure import label
+
 
 def segment(input_nii_path, output_nii_path):
     """ Segments the hippocampi on a 3D T1-weighted MRI
@@ -26,9 +30,56 @@ def segment(input_nii_path, output_nii_path):
     lh_model_path = hippocampus_paths_config['lh_model_path']
     rh_cropped_model_path = hippocampus_paths_config['rh_cropped_model_path']
     lh_cropped_model_path = hippocampus_paths_config['lh_cropped_model_path']
-    
-    # Predict
+    t1_mni_path = hippocampus_paths_config['t1_mni_path']
+    working_path = r'./working/hipposeg'
+    if os.path.exists(working_path):
+        shutil.rmtree(working_path)
+    os.mkdir(working_path)
+
+    # Convert to axial, bias correct, register, convert to uint16
     input_sitk = nii2sitk(input_nii_path)
+    input_sitk = to_axial(input_sitk)
+
+    # Resample MNI template to 1 mm isovoxel (it's 0.5, and already in axial plane)
+    mni_tmp_path = os.path.join(working_path, 't1_mni_1mmiso.nii.gz')
+    if not os.path.exists(mni_tmp_path):
+        t1_mni_image = nii2sitk(t1_mni_path)
+        t1_mni_resampled_image = resample_spacing(t1_mni_image, new_spacing=[1,1,1])
+        sitk.WriteImage(t1_mni_resampled_image, mni_tmp_path)
+
+    # Bias Correct
+    input_axial_path = os.path.join(working_path, 'input_a.nii.gz')
+    sitk.WriteImage(input_sitk, input_axial_path)
+    input_axial_bc_path = os.path.join(working_path, 'input_a_bc.nii.gz')
+    image = ants.image_read(input_axial_path)
+    image_n4 = ants.n4_bias_field_correction(image).astype('uint32')
+    ants.image_write(image_n4, input_axial_bc_path, ri=False)
+
+    # Register to MNI
+    input_axial_bc_registered_path = os.path.join(working_path, 'input_a_bc_r.nii.gz')
+    fi = ants.image_read(mni_tmp_path, pixeltype='float', reorient=False)
+    mi = ants.image_read(input_axial_bc_path, pixeltype='float', reorient=False)
+    mi = ants.resample_image(mi, (fi.shape[0], fi.shape[1], mi.shape[2]), 1, 0)
+    # “Similarity”: Similarity transformation: scaling, rotation and translation.
+    mytx = ants.registration(fixed=fi, moving=mi, type_of_transform = 'Similarity' )
+    transform_tmp_path = os.path.join(working_path, 'ants_transform.mat')
+    shutil.copy(mytx['fwdtransforms'][0], transform_tmp_path)
+    transform = sitk.ReadTransform(transform_tmp_path) 
+    fixed_image_sitk = nii2sitk(mni_tmp_path)
+    moving_image_sitk = nii2sitk(input_axial_bc_path)
+    resampler = sitk.ResampleImageFilter()
+    resampler.SetReferenceImage(fixed_image_sitk)
+    resampler.SetTransform(transform)
+    resampler.SetInterpolator(sitk.sitkBSpline)
+    registered_orig_t1_sitk = resampler.Execute(moving_image_sitk)
+    sitk.WriteImage(registered_orig_t1_sitk, input_axial_bc_registered_path)
+    os.remove(transform_tmp_path)
+
+    # Convert to uint16
+    input_sitk = nii2sitk(input_axial_bc_registered_path)
+    input_sitk = sitk.Cast(input_sitk, sitk.sitkInt16)
+
+    # Predict
     r_prediction = predict_high_res(input_sitk, rh_model_path, rh_cropped_model_path)
     l_prediction = predict_high_res(input_sitk, lh_model_path, lh_cropped_model_path)
 
@@ -41,7 +92,276 @@ def segment(input_nii_path, output_nii_path):
     hippocampi_predictions = sitk.GetImageFromArray(hippocampi_array)
     hippocampi_predictions.CopyInformation(r_prediction)
 
-    sitk.WriteImage(output_nii_path) 
+    sitk.WriteImage(hippocampi_predictions, output_nii_path) 
+
+    #shutil.rmtree(working_path)
+
+def add_columns(input_image, num_columns, add_even=True, add_right=False, add_left=False, fill_data=None):
+    """ Add columns to an sitk image
+
+    Parameters:
+        input_image (sitk.Image): SITK Image to add columns to (will not be modified)
+        num_columns (int): Number of columns to add
+        add_even (bool): Distribute the columns evenly between right and left
+        add_right (bool): Add columns only to the right
+        add_left (bool): Add columns only to the left
+        fill_data (float): Voxel value for the extra data. Defaults to the min voxel value. Can be np.nan
+    Returns:
+        output_image (sitk.Image): SITK Image with columns added
+    """    
+    input_image_data = sitk.GetArrayFromImage(input_image)
+    input_image_data_added = None
+    if fill_data is None:
+        fill_data = np.amin(input_image_data)
+
+    # sitk data is z,y,x
+    right_num_columns = None
+    left_num_columns = None
+    right_columns = None
+    left_columns = None
+    if add_even:
+        right_num_columns = int(np.floor(num_columns/2))
+        left_num_columns = int(np.ceil(num_columns/2))
+        right_columns = np.full((input_image_data.shape[0], input_image_data.shape[1], right_num_columns), fill_data)
+        left_columns = np.full((input_image_data.shape[0], input_image_data.shape[1], left_num_columns), fill_data)
+        input_image_data_added = np.concatenate((right_columns, input_image_data, left_columns), axis=2)
+    elif add_right:
+        right_num_columns = num_columns
+        right_columns = np.full((input_image_data.shape[0], input_image_data.shape[1], right_num_columns), fill_data)
+        input_image_data_added = np.concatenate((right_columns, input_image_data), axis=2)
+    elif add_left:
+        left_num_columns = num_columns
+        left_columns = np.full((input_image_data.shape[0], input_image_data.shape[1], left_num_columns), fill_data)
+        input_image_data_added = np.concatenate((input_image_data, left_columns), axis=2)
+
+    output_image = sitk.GetImageFromArray(input_image_data_added)
+    new_origin = None
+    if right_num_columns is not None: 
+        new_origin = input_image.TransformIndexToPhysicalPoint((int(-right_num_columns),0,0))
+    else:
+        new_origin = input_image.GetOrigin()
+    
+    output_image.SetOrigin(new_origin)
+    output_image.SetSpacing(input_image.GetSpacing())
+    output_image.SetDirection(input_image.GetDirection())
+
+    return output_image 
+
+
+def add_padding_for_transform(input_image, transform, xy=True, z=True):
+    """ Pad an image so as not to lose data with the provided transform
+
+    Parameters:
+        input_image (sitk.Image): SITK Image to pad (will not be modified)
+        transform (sitk.Transform) STIK transform that will be applied
+        xy (bool): Add padding to rows and columns
+        z (bool): Add padding to slices
+    Returns:
+        output_image (sitk.Image): Padded SITK Image
+    """    
+    input_image_data = sitk.GetArrayFromImage(input_image)
+    output_image = sitk.GetImageFromArray(input_image_data)
+    output_image.CopyInformation(input_image)     
+    
+    #Compute the bounding box of the rotated volume
+    start_index = [0,0,0] # x,y,z
+    end_index = [sz-1 for sz in input_image.GetSize()] # x,y,z
+    orig_indices = list(product(*zip(start_index, end_index)))
+    orig_min_indices = np.min(orig_indices,0) # x,y,z
+    orig_max_indices = np.max(orig_indices,0) # x,y,z    
+
+    physical_corners = [input_image.TransformIndexToPhysicalPoint(corner) for corner in list(product(*zip(start_index, end_index)))]
+    transformed_corners = [transform.TransformPoint(corner) for corner in physical_corners]
+    transformed_indices = [input_image.TransformPhysicalPointToIndex(corner) for corner in transformed_corners]
+    transformed_min_indices = np.min(transformed_indices,0) # x,y,z
+    transformed_max_indices = np.max(transformed_indices,0) # x,y,z
+
+    if xy:
+        # Right
+        right_diff = orig_min_indices[0] - transformed_min_indices[0]
+        if right_diff > 0:
+            output_image = add_columns(output_image, num_columns=right_diff, add_even=False, add_right=True, add_left=False)
+        # Left
+        left_diff = transformed_max_indices[0] - orig_max_indices[0]
+        if left_diff > 0:
+            output_image = add_columns(output_image, num_columns=left_diff, add_even=False, add_right=False, add_left=True)
+        
+        # Anterior
+        anterior_diff = orig_min_indices[1] - transformed_min_indices[1]
+        if anterior_diff > 0:
+            output_image = add_rows(output_image, num_rows=anterior_diff, add_even=False, add_anterior=True, add_posterior=False)
+        # Posterior
+        posterior_diff = transformed_max_indices[1] - orig_max_indices[1]
+        if posterior_diff > 0:
+            output_image = add_rows(output_image, num_rows=posterior_diff, add_even=False, add_anterior=True, add_posterior=False)
+
+    if z:
+        # Inferior
+        inferior_diff = orig_min_indices[2] - transformed_min_indices[2]
+        if inferior_diff > 0:
+            output_image = add_slices(output_image, num_slices=inferior_diff, add_even=False, add_inferior=True, add_superior=False)
+        # Superior
+        superior_diff = transformed_max_indices[2] - orig_max_indices[2]
+        if superior_diff > 0:
+            output_image = add_slices(output_image, num_slices=superior_diff, add_even=False, add_inferior=False, add_superior=True)
+
+    return output_image
+
+
+def add_rows(input_image, num_rows, add_even=True, add_anterior=False, add_posterior=False, fill_data=None):
+    """ Add rows to an sitk image
+
+    Parameters:
+        input_image (sitk.Image): SITK Image to add rows to (will not be modified)
+        num_rows (int): Number of rows to add
+        add_even (bool): Distribute the rows evenly between anterior and posterior
+        add_anterior (bool): Add rows only anterior
+        add_posterior (bool): Add columns only posterior
+        fill_data (float): Voxel value for the extra data. Defaults to the min voxel value. Can be np.nan
+    Returns:
+        output_image (sitk.Image): SITK Image with columns added
+    """     
+    input_image_data = sitk.GetArrayFromImage(input_image)
+    input_image_data_added = None
+    if fill_data is None:
+        fill_data = np.amin(input_image_data)
+
+    # sitk data is z,y,x
+    anterior_num_rows = None
+    posterior_num_rows = None
+    anterior_rows = None
+    posterior_rows = None
+    if add_even:
+        anterior_num_rows = int(np.floor(num_rows/2))
+        posterior_num_rows = int(np.ceil(num_rows/2))
+        anterior_rows = np.full((input_image_data.shape[0], anterior_num_rows, input_image_data.shape[2]), fill_data)
+        posterior_rows = np.full((input_image_data.shape[0], posterior_num_rows, input_image_data.shape[2]), fill_data)
+        input_image_data_added = np.concatenate((anterior_rows, input_image_data, posterior_rows), axis=1)
+    elif add_anterior:
+        anterior_num_rows = num_rows
+        anterior_rows = np.full((input_image_data.shape[0], anterior_num_rows, input_image_data.shape[2]), fill_data)
+        input_image_data_added = np.concatenate((anterior_rows, input_image_data), axis=1)
+    elif add_posterior:
+        posterior_num_rows = num_rows
+        posterior_rows = np.full((input_image_data.shape[0], posterior_num_rows, input_image_data.shape[2]), fill_data)
+        input_image_data_added = np.concatenate((input_image_data, posterior_rows), axis=1)
+
+    output_image = sitk.GetImageFromArray(input_image_data_added)
+    new_origin = None
+    if anterior_num_rows is not None: 
+        new_origin = input_image.TransformIndexToPhysicalPoint((0,int(-anterior_num_rows),0))
+    else:
+        new_origin = input_image.GetOrigin()
+    
+    output_image.SetOrigin(new_origin)
+    output_image.SetSpacing(input_image.GetSpacing())
+    output_image.SetDirection(input_image.GetDirection())
+
+    return output_image
+
+def add_slices(input_image, num_slices, add_even=True, add_inferior=False, add_superior=False, fill_data=None):
+    """ Add slices to an sitk image
+
+    Parameters:
+        input_image (sitk.Image): SITK Image to add slices to (will not be modified)
+        num_slices (int): Number of slices to add
+        add_even (bool): Distribute the slices evenly between inferior and superior
+        add_inferior (bool): Add rows only to the inferior
+        add_superior (bool): Add columns only to the superior
+        fill_data (float): Voxel value for the extra data. Defaults to the min voxel value. Can be np.nan
+    Returns:
+        output_image (sitk.Image): SITK Image with columns added
+    """    
+    input_image_data = sitk.GetArrayFromImage(input_image)
+    input_image_data_added = None
+    if fill_data is None:
+        fill_data = np.amin(input_image_data)
+
+    # sitk data is z,y,x
+    inferior_num_slices = None
+    superior_num_slices = None
+    inferior_slices = None
+    superior_slices = None
+    if add_even:
+        inferior_num_slices = int(np.floor(num_slices/2))
+        superior_num_slices = int(np.ceil(num_slices/2))
+        inferior_slices = np.full((inferior_num_slices, input_image_data.shape[1], input_image_data.shape[2]), fill_data)
+        superior_slices = np.full((superior_num_slices, input_image_data.shape[1], input_image_data.shape[2]), fill_data)
+        input_image_data_added = np.concatenate((inferior_slices, input_image_data, superior_slices), axis=0)
+    elif add_inferior:
+        inferior_num_slices = num_slices
+        inferior_slices = np.full((inferior_num_slices, input_image_data.shape[1], input_image_data.shape[2]), fill_data)
+        input_image_data_added = np.concatenate((inferior_slices, input_image_data), axis=0)
+    elif add_superior:
+        superior_num_slices = num_slices
+        superior_slices = np.full((superior_num_slices, input_image_data.shape[1], input_image_data.shape[2]), fill_data)
+        input_image_data_added = np.concatenate((input_image_data, superior_slices), axis=0)
+
+    output_image = sitk.GetImageFromArray(input_image_data_added)
+    new_origin = None
+    if inferior_num_slices is not None: 
+        new_origin = input_image.TransformIndexToPhysicalPoint((0,0,int(-inferior_num_slices)))
+    else:
+        new_origin = input_image.GetOrigin()
+    
+    output_image.SetOrigin(new_origin)
+    output_image.SetSpacing(input_image.GetSpacing())
+    output_image.SetDirection(input_image.GetDirection())
+
+    return output_image
+
+def composite(input_image, transforms, maintain_xy_data=True, maintain_z_data=True, maintain_physical_location=True, interpolation=sitk.sitkBSpline, padding_empty_voxel_value=None, segmentation=False, verbose=False):
+    """ Applies a list of transforms as a composite transform
+    Parameters:
+        input_image (sitk.Image): SimpleITK image, will not be modified
+        transforms (list): List of transforms to apply
+        maintain_xy_data (bool): If true, rows and columns will not be truncated
+        maintain_z_data (bool): If true, slices will not be truncated
+        maintain_physical_location (bool): If true, the physical location of the rotated image is maintained
+        interpolation (optional): SimpleITK interpolation method - default is sitk.sitkLinear
+        verbose (bool): Verbose flag
+    Returns:
+        transformed SimpleITK image    
+    """
+    start_time = None
+    if verbose:
+        start_time = time.time()
+        print("Applying transforms as composite..", end = '')
+
+    composite_transform = sitk.CompositeTransform(transforms)
+
+    input_image_data = sitk.GetArrayFromImage(input_image)
+    #padding_empty_voxel_value = np.amin(input_image_data)
+    padding_empty_voxel_value = determine_empty_voxel_value(input_image)
+    working_image = sitk.GetImageFromArray(input_image_data)
+    working_image.CopyInformation(input_image) 
+
+    if maintain_xy_data or maintain_z_data:
+        working_image = add_padding_for_transform(working_image, transform=composite_transform, xy=maintain_xy_data, z=maintain_z_data)
+
+    working_image_data = sitk.GetArrayFromImage(working_image)
+    min_value = np.amin(working_image_data)
+
+    # Composite transforms were applied stack-based - first in, last applied
+    # With sitk 2.0 there is now a CompositeTransform class. Not sure what order they're applied.
+    working_image = sitk.Resample(working_image, composite_transform, interpolation, float(min_value)) # Float required for Resample
+
+    if maintain_physical_location:
+        # Adjust the image direction
+        new_direction = transform_direction(working_image, composite_transform)
+        working_image.SetDirection(new_direction)
+        
+        # Adjust the image origin
+        new_origin = transform_origin(working_image, composite_transform)
+        working_image.SetOrigin(new_origin)
+
+    if maintain_xy_data or maintain_z_data:
+        working_image = remove_padding(working_image, padding_empty_voxel_value, xy=maintain_xy_data, z=maintain_z_data, segmentation=segmentation)
+
+    if verbose:
+        print('.done - time = ' + str(np.around((time.time() - start_time), decimals=1)) + 'sec') 
+
+    return working_image 
 
 def crop_around_prediction(input_sitk, input_label_sitk, crop_size=None, verbose=False):
     """ Crops a simple ITK image and label around the label so that prediction can be done at full resolution. Crops at 1/4 the size in x and y
@@ -151,6 +471,13 @@ def crop_around_prediction(input_sitk, input_label_sitk, crop_size=None, verbose
 
     return cropped_sitk, cropped_input_label_sitk, crop_indices
 
+def determine_empty_voxel_value(input_image):
+    input_image_data = sitk.GetArrayFromImage(input_image)
+    min_value = np.amin(input_image_data[int(input_image.GetSize()[2]/2),:,:])
+    sd = np.nanstd(input_image_data)
+    empty_voxel_value = int(min_value + sd/10)
+    return empty_voxel_value
+
 def determine_plane(image_sitk=None, sitk_direction=None):
     """
     Determines the orientation of the study (axial, sagittal, coronal). Must provide either a path to DICOM or a SimpleITK Image
@@ -187,6 +514,51 @@ def determine_plane(image_sitk=None, sitk_direction=None):
 
     return orientation
 
+def get_rotate_transform(input_image, angle, pitch=False, roll=False, yaw=False, verbose=False):
+    """ Generates a transform to rotate an image along 1 axis
+    Based on: https://stackoverflow.com/questions/56171643/simpleitk-rotation-of-mri-image
+
+    Parameters:
+        input_image: SimpleITK image that has been loaded by the load_sitk method
+        angle: Angle in degrees to rotate the image counterclockwise
+        pitch (bool): rotate the image in a pitch direction (around x axis)
+        roll (bool): rotate the image in a roll direction (around y axis)
+        yaw (bool): rotate the image in a yaw direction (around z axis)
+        verbose (bool): Verbose flag
+    Returns:
+        rotated SimpleITK image    
+    """
+    start_time = None
+    if verbose:
+        start_time = time.time()
+        print("Generating rotate transform..", end = '')
+            
+    angle_rads = np.deg2rad(angle)
+    euler_transform = sitk.Euler3DTransform()
+    x, y, z = input_image.GetSize()
+    image_center = input_image.TransformIndexToPhysicalPoint((int(np.ceil(x/2)), int(np.ceil(y/2)), int(np.ceil(z/2))))
+    euler_transform.SetCenter(image_center)
+
+    direction = input_image.GetDirection()
+    axis_angle = None
+    
+    if pitch:
+        axis_angle = (direction[0], direction[3], direction[6], angle_rads)
+    elif roll:
+        axis_angle = (direction[1], direction[4], direction[7], angle_rads)
+    elif yaw:
+        axis_angle = (direction[2], direction[5], direction[8], angle_rads)
+
+    if axis_angle is None:
+        raise ValueError("transform.get_rotate_transform: pitch, roll, or yaw must be set to True")
+    np_rot_mat = matrix_from_axis_angle(axis_angle)
+    euler_transform.SetMatrix(np_rot_mat.flatten().tolist())
+
+    if verbose:
+        print('.done - time = ' + str(np.around((time.time() - start_time), decimals=1)) + 'sec')
+    
+    return euler_transform
+
 def keep_only_largest_connected_components(prediction_data):
     """ Keeps the largest connected component of each label class (e.g. largest '1', largest '2', etc)
 
@@ -207,6 +579,42 @@ def keep_only_largest_connected_components(prediction_data):
             largest_cc_indices = labels == np.argmax(np.bincount(labels.flat)[1:])+1 # np.bincount counts the "size" of each component, np.argmax picks the largest one
             prediction_data_new[largest_cc_indices] = label_num
     return prediction_data_new
+
+# This function is from https://github.com/rock-learning/pytransform3d/blob/7589e083a50597a75b12d745ebacaa7cc056cfbd/pytransform3d/rotations.py#L302
+def matrix_from_axis_angle(a):
+    """ Compute rotation matrix from axis-angle.
+    This is called exponential map or Rodrigues' formula.
+    https://en.wikipedia.org/wiki/Rotation_matrix#Axis_and_angle
+    Parameters
+    ----------
+    a : array-like, shape (4,)
+        Axis of rotation and rotation angle: (x, y, z, angle)
+    Returns
+    -------
+    R : array-like, shape (3, 3)
+        Rotation matrix
+    """
+    ux, uy, uz, theta = a
+    c = np.cos(theta)
+    s = np.sin(theta)
+    ci = 1.0 - c
+    R = np.array([[ci * ux * ux + c,
+                   ci * ux * uy - uz * s,
+                   ci * ux * uz + uy * s],
+                  [ci * uy * ux + uz * s,
+                   ci * uy * uy + c,
+                   ci * uy * uz - ux * s],
+                  [ci * uz * ux - uy * s,
+                   ci * uz * uy + ux * s,
+                   ci * uz * uz + c],
+                  ])
+
+    # This is equivalent to
+    # R = (np.eye(3) * np.cos(theta) +
+    #      (1.0 - np.cos(theta)) * a[:3, np.newaxis].dot(a[np.newaxis, :3]) +
+    #      cross_product_matrix(a[:3]) * np.sin(theta))
+
+    return R
 
 def nii2sitk(nii_path, transform_pixels_to_standard_orientation=True, verbose=False):
     """ Loads an nii file as an SITK image
@@ -658,6 +1066,166 @@ def predict_low_res_interpolate(input_sitk, model_path, spacing=(1.5,1.5,1.5), r
 
     return corrected_predict_sitk
 
+def remove_empty_columns(input_image, empty_voxel_value=None, segmentation=False):
+    """ Removes all empty columns from an image. Any empty column has every value equal to the min value for the image.
+
+    Parameters:
+        input_image (sitk.Image): SITK Image to remove empty columns from
+    Returns:
+        output_image (sitk.Image): SITK Image with empty columns removed
+    """
+    # sitk data is z,y,x
+    input_image_data = sitk.GetArrayFromImage(input_image)
+    input_image_data_removed = None
+    if empty_voxel_value is None:
+        empty_voxel_value = determine_empty_voxel_value(input_image)
+    else:
+        if not segmentation:
+            empty_voxel_value = empty_voxel_value+1 # Correct for noise introduced by bspline interpolation
+
+    # The next 2 operations create a (1 x num_columns) array that is true if the column is empty, false otherwise
+    empty_columns = np.all(input_image_data <= empty_voxel_value, axis=1)
+    empty_columns = np.all(empty_columns, axis=0)
+
+    # Then find indices of the non-empty columns
+    non_empty_indices = np.where(empty_columns == False)[0]
+
+    # Then find the number of right and left empty columns
+    num_right_empty_columns = int(non_empty_indices[0])
+    num_left_empty_columns = (input_image.GetSize()[0]-1) - non_empty_indices[-1]
+
+    # Then delete the columns
+    input_image_data_removed = input_image_data[:,:,num_right_empty_columns:input_image.GetSize()[0]-num_left_empty_columns]
+    
+    # Recaulculate the origin
+    output_image = sitk.GetImageFromArray(input_image_data_removed)
+    new_origin = None
+    if num_right_empty_columns != 0: 
+        new_origin = input_image.TransformIndexToPhysicalPoint((num_right_empty_columns,0,0))
+    else:
+        new_origin = input_image.GetOrigin()
+    
+    output_image.SetOrigin(new_origin)
+    output_image.SetSpacing(input_image.GetSpacing())
+    output_image.SetDirection(input_image.GetDirection())
+
+    return output_image
+
+def remove_empty_rows(input_image, empty_voxel_value=None, segmentation=False):
+    """ Removes all empty rows from an image. Any empty row has every value equal to the min value for the image.
+
+    Parameters:
+        input_image (sitk.Image): SITK Image to remove empty rows from
+    Returns:
+        output_image (sitk.Image): SITK Image with empty rows removed
+    """
+    # sitk data is z,y,x
+    input_image_data = sitk.GetArrayFromImage(input_image)
+    input_image_data_removed = None
+    if empty_voxel_value is None:
+        empty_voxel_value = determine_empty_voxel_value(input_image)
+    else:
+        if not segmentation:
+            empty_voxel_value = empty_voxel_value+1 # Correct for noise introduced by bspline interpolation
+
+    # The next 2 operations create a (1 x num_rows) array that is true if the row is empty, false otherwise
+    empty_rows = np.all(input_image_data <= empty_voxel_value, axis=2)
+    empty_rows = np.all(empty_rows, axis=0)
+
+    # Then find indices of the non-empty rows
+    non_empty_indices = np.where(empty_rows == False)[0]
+
+    # Then find the number of anterior and posterior empty rows
+    num_anterior_empty_rows = int(non_empty_indices[0])
+    num_posterior_empty_rows = (input_image.GetSize()[1]-1) - non_empty_indices[-1]
+
+    # Then delete the rows
+    input_image_data_removed = input_image_data[:,num_anterior_empty_rows:input_image.GetSize()[1]-num_posterior_empty_rows,:]
+    
+    # Recaulculate the origin
+    output_image = sitk.GetImageFromArray(input_image_data_removed)
+    new_origin = None
+    if num_anterior_empty_rows != 0: 
+        new_origin = input_image.TransformIndexToPhysicalPoint((0,num_anterior_empty_rows,0))
+    else:
+        new_origin = input_image.GetOrigin()
+    
+    output_image.SetOrigin(new_origin)
+    output_image.SetSpacing(input_image.GetSpacing())
+    output_image.SetDirection(input_image.GetDirection())
+
+    return output_image
+
+def remove_empty_slices(input_image, empty_voxel_value=None, segmentation=False):
+    """ Removes all empty slices from an image. Any empty row has every value equal to the min value for the image.
+
+    Parameters:
+        input_image (sitk.Image): SITK Image to remove empty slices from
+    Returns:
+        output_image (sitk.Image): SITK Image with empty slices removed
+    """
+    # sitk data is z,y,x
+    input_image_data = sitk.GetArrayFromImage(input_image)
+    input_image_data_removed = None
+    if empty_voxel_value is None:
+        empty_voxel_value = determine_empty_voxel_value(input_image)
+    else:
+        if not segmentation:
+            empty_voxel_value = empty_voxel_value+1 # Correct for noise introduced by bspline interpolation
+
+    # The next 2 operations create a (1 x num_slices) array that is true if the slice is empty, false otherwise
+    empty_slices = np.all(input_image_data <= empty_voxel_value, axis=1)
+    empty_slices = np.all(empty_slices, axis=1)
+
+    # Then find indices of the non-empty slices
+    non_empty_indices = np.where(empty_slices == False)[0]
+
+    # Then find the number of inferior and superior empty slices
+    num_inferior_empty_slices = int(non_empty_indices[0])
+    num_superior_empty_slices = (input_image.GetSize()[2]-1) - non_empty_indices[-1]
+
+    # Then delete the slices
+    input_image_data_removed = input_image_data[num_inferior_empty_slices:input_image.GetSize()[2]-num_superior_empty_slices,:,:]
+    
+    # Recaulculate the origin
+    output_image = sitk.GetImageFromArray(input_image_data_removed)
+    new_origin = None
+    if num_inferior_empty_slices != 0: 
+        new_origin = input_image.TransformIndexToPhysicalPoint((0,0,num_inferior_empty_slices))
+    else:
+        new_origin = input_image.GetOrigin()
+    
+    output_image.SetOrigin(new_origin)
+    output_image.SetSpacing(input_image.GetSpacing())
+    output_image.SetDirection(input_image.GetDirection())
+
+    return output_image
+
+def remove_padding(input_image, empty_voxel_value=None, xy=True, z=True, segmentation=False):
+    """ Remove padding added to an image via add_padding
+
+    Parameters:
+        input_image (sitk.Image): SITK Image to remove padding from (will not be modified)
+    Returns:
+        output_image (sitk.Image): De-padded SITK Image
+    """
+    # Find the min voxel value at the first slice - assume that is padding
+    # Otherwise, bspline interpolation introduces some lower values at the edge of the actual image
+    if empty_voxel_value is None:
+        empty_voxel_value = determine_empty_voxel_value(input_image)
+
+    input_image_data = sitk.GetArrayFromImage(input_image)
+    output_image = sitk.GetImageFromArray(input_image_data)
+    output_image.CopyInformation(input_image)
+
+    if xy:
+        output_image = remove_empty_columns(output_image, empty_voxel_value=empty_voxel_value, segmentation=segmentation)
+        output_image = remove_empty_rows(output_image, empty_voxel_value=empty_voxel_value, segmentation=segmentation)
+    if z:
+        output_image = remove_empty_slices(output_image, empty_voxel_value=empty_voxel_value, segmentation=segmentation)
+
+    return output_image
+
 def resample_spacing(input_image, new_spacing=[1,1,1], interpolation=sitk.sitkBSpline, verbose=False):
     """ Resamples to the specified pixel spacing, in mm
 
@@ -703,6 +1271,42 @@ def resample_spacing(input_image, new_spacing=[1,1,1], interpolation=sitk.sitkBS
 
     return output_image
 
+def to_axial(input_sitk, interpolation=sitk.sitkBSpline, rotate_without_interpolation=False, maintain_physical_location=True, maintain_data=True, segmentation=False, verbose=False):
+    """ Rotates an image into the axial plane. Does nothing if already axial.
+
+    Parameters:
+        input_sitk: SimpleITK image that has been loaded by the load_sitk method
+        interpolation (sitk interpolation method): SimpleITK interpolation method - sitk.sitkLinear is faster, sitk.sitkBSpline is more accurate and slightly slower
+        rotate_without_interpolation (bool): If true, only rotates pixels in 90 degree increment with no interpolation
+        maintain_physical_location (bool): If true, the physical location of the image is maintained
+        verbose (bool): Verbose flag
+    Returns:
+        axial_sitk (sitk.Image): Axial version of image. None returned if apply_transforms=False
+        transforms (list): Lisimage_sitkt of transforms (None returned if only rotating without interpolation)
+    """
+    standard_input_sitk = pixels_to_standard_orientation(input_sitk)
+    axial_sitk = None
+    transforms = None
+    
+    plane = determine_plane(image_sitk=standard_input_sitk)
+    if plane == 'axial':
+        axial_sitk = standard_input_sitk
+    elif plane == 'coronal':         
+        transforms = []
+        pitch_transform = get_rotate_transform(standard_input_sitk, -90, pitch=True, verbose=False) # Clockwise
+        transforms.append(pitch_transform)
+        axial_sitk = composite(standard_input_sitk, transforms, maintain_xy_data=maintain_data, maintain_z_data=maintain_data, maintain_physical_location=maintain_physical_location, interpolation=interpolation, segmentation=segmentation, verbose=verbose)
+    elif plane == 'sagittal':
+        transforms = []
+        roll_transform = get_rotate_transform(standard_input_sitk, 90, roll=True, verbose=False) # Counter-clockwise
+        transforms.append(roll_transform)
+        pitch_transform = get_rotate_transform(standard_input_sitk, 90, pitch=True, verbose=False) # Counter-clockwise
+        transforms.append(pitch_transform)
+        axial_sitk = composite(standard_input_sitk, transforms, maintain_xy_data=maintain_data, maintain_z_data=maintain_data, maintain_physical_location=maintain_physical_location, interpolation=interpolation, segmentation=segmentation, verbose=verbose)
+
+    axial_sitk = pixels_to_standard_orientation(axial_sitk)
+    return axial_sitk
+
 def toInt16(input_image, force_signed=False, force_unsigned=False):
     """ Casts an SITK image to signed or unsigned int16 unless it is 4D (e.g. DWI source) or RGB (8 bit). 
     Parameters:
@@ -734,3 +1338,43 @@ def toInt16(input_image, force_signed=False, force_unsigned=False):
                     image_16 = rescaled_sitk      
                 image_16 = sitk.Cast(image_16, sitk.sitkInt16)
     return image_16
+
+def transform_direction(input_sitk, transform):
+    """ Applies a transform to the image direction vectors
+
+    Parameters:
+        input_sitk: SimpleITK image that has been loaded by the load_sitk method
+        transform: SimpleITK transform to apply to the direction vectors
+    Returns:
+        new_direction (list): List of vectors compatible with SimpleITK.SetDirection()
+    """    
+    x, y, z = input_sitk.GetSize()
+    image_center = input_sitk.TransformIndexToPhysicalPoint((int(np.ceil(x/2)), int(np.ceil(y/2)), int(np.ceil(z/2))))
+    
+    # Adjust the image direction
+    d = input_sitk.GetDirection()
+    vector_x = (d[0], d[3], d[6])
+    vector_y = (d[1], d[4], d[7])
+    vector_z = (d[2], d[5], d[8])                                                
+
+    new_vector_x = transform.TransformVector(vector_x, image_center)
+    new_vector_y = transform.TransformVector(vector_y, image_center)
+    new_vector_z = transform.TransformVector(vector_z, image_center)
+
+    new_direction = (new_vector_x[0], new_vector_y[0], new_vector_z[0],
+                    new_vector_x[1], new_vector_y[1], new_vector_z[1],
+                    new_vector_x[2], new_vector_y[2], new_vector_z[2])
+
+    return new_direction 
+
+def transform_origin(input_sitk, transform):
+    """ Transforms the origin of an SimpleITK image
+
+    Parameters:
+        input_sitk: SimpleITK image that has been loaded by the load_sitk method
+        transform: SimpleITK transform to apply to the origin
+    Returns:
+        new_direction (list): List of vectors compatible with SimpleITK.SetDirection()
+    """ 
+    new_origin = transform.TransformPoint(input_sitk.GetOrigin())
+    return new_origin
