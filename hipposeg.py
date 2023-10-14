@@ -22,7 +22,7 @@ def segment(input_nii_path, output_nii_path):
         input_nii_path (str): Full path to the .nii file to segment
         output_nii_path (str): Full path to the .nii file to write to - any existing file will be overwritten. Label 1 = right hippocampus, label 2 = left hippocampus
     """
-
+    print("Segmenting hippocampi on Human Connectome Project MRI Brain")
     hippocampus_config = configparser.ConfigParser()
     hippocampus_config.read('./paths.ini')
     hippocampus_paths_config = hippocampus_config['paths']
@@ -36,29 +36,19 @@ def segment(input_nii_path, output_nii_path):
         shutil.rmtree(working_path)
     os.mkdir(working_path)
 
-    # Convert to axial, bias correct, register, convert to uint16
-    input_sitk = nii2sitk(input_nii_path)
-    input_sitk = to_axial(input_sitk)
-
     # Resample MNI template to 1 mm isovoxel (it's 0.5, and already in axial plane)
+    print(" - Resampling MNI template to 1 mm isovoxel")
     mni_tmp_path = os.path.join(working_path, 't1_mni_1mmiso.nii.gz')
     if not os.path.exists(mni_tmp_path):
         t1_mni_image = nii2sitk(t1_mni_path)
         t1_mni_resampled_image = resample_spacing(t1_mni_image, new_spacing=[1,1,1])
         sitk.WriteImage(t1_mni_resampled_image, mni_tmp_path)
 
-    # Bias Correct
-    input_axial_path = os.path.join(working_path, 'input_a.nii.gz')
-    sitk.WriteImage(input_sitk, input_axial_path)
-    input_axial_bc_path = os.path.join(working_path, 'input_a_bc.nii.gz')
-    image = ants.image_read(input_axial_path)
-    image_n4 = ants.n4_bias_field_correction(image).astype('uint32')
-    ants.image_write(image_n4, input_axial_bc_path, ri=False)
-
     # Register to MNI
-    input_axial_bc_registered_path = os.path.join(working_path, 'input_a_bc_r.nii.gz')
+    print(" - Registering T1 to MNI")
+    input_axial_registered_path = os.path.join(working_path, 'input_a_bc_r.nii.gz')
     fi = ants.image_read(mni_tmp_path, pixeltype='float', reorient=False)
-    mi = ants.image_read(input_axial_bc_path, pixeltype='float', reorient=False)
+    mi = ants.image_read(input_nii_path, pixeltype='float', reorient=False)
     mi = ants.resample_image(mi, (fi.shape[0], fi.shape[1], mi.shape[2]), 1, 0)
     # “Similarity”: Similarity transformation: scaling, rotation and translation.
     mytx = ants.registration(fixed=fi, moving=mi, type_of_transform = 'Similarity' )
@@ -66,20 +56,26 @@ def segment(input_nii_path, output_nii_path):
     shutil.copy(mytx['fwdtransforms'][0], transform_tmp_path)
     transform = sitk.ReadTransform(transform_tmp_path) 
     fixed_image_sitk = nii2sitk(mni_tmp_path)
-    moving_image_sitk = nii2sitk(input_axial_bc_path)
+    moving_image_sitk = nii2sitk(input_nii_path)
     resampler = sitk.ResampleImageFilter()
     resampler.SetReferenceImage(fixed_image_sitk)
     resampler.SetTransform(transform)
     resampler.SetInterpolator(sitk.sitkBSpline)
     registered_orig_t1_sitk = resampler.Execute(moving_image_sitk)
-    sitk.WriteImage(registered_orig_t1_sitk, input_axial_bc_registered_path)
+    sitk.WriteImage(registered_orig_t1_sitk, input_axial_registered_path)
     os.remove(transform_tmp_path)
 
     # Convert to uint16
-    input_sitk = nii2sitk(input_axial_bc_registered_path)
+    input_sitk = nii2sitk(input_axial_registered_path)
     input_sitk = sitk.Cast(input_sitk, sitk.sitkInt16)
+    sitk.WriteImage(input_sitk, os.path.join(working_path, 'T1.nii.gz'))
+    
+    # Clean up
+    os.remove(input_axial_registered_path)
+    os.remove(mni_tmp_path)
 
     # Predict
+    print(" - Predicting hippocampi")
     r_prediction = predict_high_res(input_sitk, rh_model_path, rh_cropped_model_path)
     l_prediction = predict_high_res(input_sitk, lh_model_path, lh_cropped_model_path)
 
@@ -93,8 +89,7 @@ def segment(input_nii_path, output_nii_path):
     hippocampi_predictions.CopyInformation(r_prediction)
 
     sitk.WriteImage(hippocampi_predictions, output_nii_path) 
-
-    #shutil.rmtree(working_path)
+    print("Done!")
 
 def add_columns(input_image, num_columns, add_even=True, add_right=False, add_left=False, fill_data=None):
     """ Add columns to an sitk image
