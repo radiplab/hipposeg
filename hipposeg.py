@@ -14,6 +14,17 @@ from monai.inferers import sliding_window_inference
 from monai.networks.layers import Norm
 from skimage.measure import label
 
+def test():
+    test_data_path = r'./tests/test_data'
+    base_working_path = r'./working'
+    test_working_path = os.path.join(base_working_path, 'hipposeg')
+
+    if os.path.exists(test_working_path):
+        shutil.rmtree(test_working_path)
+    os.mkdir(test_working_path)
+    input_nii_path = os.path.join(test_data_path, 'HCP_100206_3T_T1w_MPR1.nii.gz')
+    output_nii_path = os.path.join(test_working_path, 'hippocampi-labels.nii.gz')
+    segment(input_nii_path, output_nii_path)
 
 def segment(input_nii_path, output_nii_path):
     """ Segments the hippocampi on a 3D T1-weighted MRI
@@ -978,10 +989,29 @@ def predict_low_res_interpolate(input_sitk, model_path, spacing=(1.5,1.5,1.5), r
     resampled_rescaled_data = resampled_rescaled_data.type(torch.FloatTensor)
 
     # Make the prediction
-    device = torch.device('cuda:0')
+    device = None
+    if torch.cuda.is_available():
+        # Get number of available GPUs
+        num_gpus = torch.cuda.device_count()
+        
+        # For simplicity, use the first GPU (you can have custom logic here)
+        # You can also set up multi-GPU training here if desired
+        selected_gpu = 0
+        
+        if num_gpus > 1:
+            print(f"{num_gpus} GPUs available. Using GPU {selected_gpu}.")
+        else:
+            print("Using the available GPU.")
+        
+        device = torch.device(f"cuda:{selected_gpu}")
+    else:
+        # Fallback to CPU
+        print("No GPU available. Using CPU.")
+        device = torch.device("cpu")
+
     model = monai.networks.nets.UNet(spatial_dims=3, in_channels=1, out_channels=num_labels+1, channels=(16, 32, 64, 128, 256),
                                     strides=(2, 2, 2, 2), num_res_units=2, norm=Norm.BATCH).to(device)                                  
-    model.load_state_dict(torch.load(model_path))
+    model.load_state_dict(torch.load(model_path, map_location=device))
     sw_batch_size = 4
 
     predict_data = sliding_window_inference(resampled_rescaled_data.to(device), roi, sw_batch_size, model)
@@ -1373,3 +1403,6 @@ def transform_origin(input_sitk, transform):
     """ 
     new_origin = transform.TransformPoint(input_sitk.GetOrigin())
     return new_origin
+
+if __name__ == '__main__':
+    test()
