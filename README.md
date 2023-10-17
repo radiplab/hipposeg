@@ -22,4 +22,8 @@ import hipposeg
 hipposeg.segment(input_nii_path, output_nii_path)
 ```
 
+## License
+This code is provided under the MIT license. As stated in the license, THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
+
+
 
